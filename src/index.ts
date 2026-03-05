@@ -39,30 +39,28 @@ app.post('/', async (c) => {
 	const allowedUserIds = parseAllowedUserIds(ALLOWED_USER_IDS)
 
 	const update = await c.req.json()
-
 	const message = update.message
+
 	if (!message) return c.text('ok')
 
-	// Only allow specific users
+	// restrict users
 	if (!message.from?.id || !allowedUserIds.includes(message.from.id)) {
 		return c.text('Unauthorized')
 	}
 
-	// Ensure file exists
 	if (!message.document) {
 		await sendMessage(BOT_TOKEN, message.from.id, '❌ Please upload a JSON file')
 		return c.text('No document')
 	}
 
-	// Ensure .json file
 	if (!message.document.file_name?.endsWith('.json')) {
 		await sendMessage(BOT_TOKEN, message.from.id, '❌ Only JSON files allowed')
-		return c.text('Invalid file type')
+		return c.text('Invalid file')
 	}
 
 	const fileId = message.document.file_id
 
-	// Step 1: Get file path from Telegram
+	// get file path
 	const fileRes = await fetch(
 		`https://api.telegram.org/bot${BOT_TOKEN}/getFile`,
 		{
@@ -76,12 +74,12 @@ app.post('/', async (c) => {
 
 	if (!fileData.ok) {
 		await sendMessage(BOT_TOKEN, message.from.id, '❌ Failed to fetch file')
-		return c.text('File fetch error')
+		return c.text('error')
 	}
 
 	const filePath = fileData.result.file_path
 
-	// Step 2: Download JSON file
+	// download json
 	const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`
 	const jsonFile = await fetch(fileUrl)
 	const text = await jsonFile.text()
@@ -96,7 +94,7 @@ app.post('/', async (c) => {
 	}
 
 	if (!Array.isArray(questions)) {
-		await sendMessage(BOT_TOKEN, message.from.id, '❌ JSON must contain an array of questions')
+		await sendMessage(BOT_TOKEN, message.from.id, '❌ JSON must contain an array')
 		return c.text('Invalid JSON structure')
 	}
 
@@ -105,27 +103,69 @@ app.post('/', async (c) => {
 
 	for (const q of questions) {
 
-		// Validate question format
-		if (!q.question || !Array.isArray(q.options) || q.options.length < 2) {
+		const questionNumber = q.Question_number
+		const questionText = q.Question
+		const options = q.Options
+		const correctOption = q.Correct_option
+		const explanation = q.Explanation
+
+		// validate structure
+		if (
+			typeof questionNumber !== 'number' ||
+			typeof questionText !== 'string' ||
+			!Array.isArray(options) ||
+			options.length < 2 ||
+			typeof correctOption !== 'number'
+		) {
 			failed++
-			await sendMessage(BOT_TOKEN, message.from.id, '❌ Poll failed: File structure sahi kar')
+			await sendMessage(BOT_TOKEN, message.from.id, `❌ Invalid question structure`)
+			continue
+		}
+
+		// ensure question number exists in question text
+		if (!questionText.includes(questionNumber.toString())) {
+			failed++
+			await sendMessage(
+				BOT_TOKEN,
+				message.from.id,
+				`❌ Question ${questionNumber}: number missing in question text`
+			)
+			continue
+		}
+
+		// validate correct option index
+		if (correctOption < 0 || correctOption >= options.length) {
+			failed++
+			await sendMessage(
+				BOT_TOKEN,
+				message.from.id,
+				`❌ Question ${questionNumber}: invalid correct option index`
+			)
 			continue
 		}
 
 		try {
+
+			const pollPayload: any = {
+				chat_id: CHANNEL_USERNAME,
+				question: questionText,
+				options: options,
+				type: "quiz",
+				correct_option_id: correctOption,
+				is_anonymous: true
+			}
+
+			// add explanation if exists
+			if (explanation) {
+				pollPayload.explanation = explanation
+			}
+
 			const pollRes = await fetch(
 				`https://api.telegram.org/bot${BOT_TOKEN}/sendPoll`,
 				{
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({
-						chat_id: CHANNEL_USERNAME,
-						question: q.question,
-						options: q.options,
-						type: "quiz",
-						correct_option_id: q.correctIndex,
-						is_anonymous: true
-					})
+					body: JSON.stringify(pollPayload)
 				}
 			)
 
@@ -142,7 +182,7 @@ app.post('/', async (c) => {
 			}
 
 			success++
-			await sleep(1000) // Avoid Telegram rate limits
+			await sleep(1000)
 
 		} catch {
 			failed++
@@ -152,7 +192,7 @@ app.post('/', async (c) => {
 	await sendMessage(
 		BOT_TOKEN,
 		message.from.id,
-		`✅ ${success} polls posted, maaro moj\n❌ ${failed} ghee khatam`
+		`✅ ${success} polls posted\n❌ ${failed} failed`
 	)
 
 	return c.text('done')
