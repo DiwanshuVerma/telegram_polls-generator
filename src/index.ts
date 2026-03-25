@@ -55,7 +55,7 @@ async function safeSendPoll(botToken: string, payload: any) {
 		// Handle rate limit
 		if (data.error_code === 429) {
 			const wait = data.parameters?.retry_after || 3
-			await sleep(wait * 1000)
+			await sleep(wait * 2000)
 			retries--
 			continue
 		}
@@ -131,7 +131,7 @@ app.post('/', async (c) => {
 	}
 
 	// 🔥 Cold start fix
-	await sleep(2000)
+	await sleep(4000)
 
 	await sendMessage(
 		BOT_TOKEN,
