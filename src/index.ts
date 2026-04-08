@@ -4,6 +4,7 @@ type Bindings = {
 	BOT_TOKEN: string
 	CHANNEL_USERNAME: string
 	ALLOWED_USER_IDS: string
+	mcqqueue: Queue
 	BOT_KV: KVNamespace
 }
 
@@ -22,162 +23,175 @@ function parseAllowedUserIds(value: string): number[] {
 	}
 }
 
-// 🔥 Safe poll sender
-async function safeSendPoll(botToken: string, payload: any) {
-	let retries = 3
+// ================= WEBHOOK =================
+app.post('/', async (c) => {
+	const { ALLOWED_USER_IDS, mcqqueue, BOT_KV, BOT_TOKEN } = c.env
+	const allowedUserIds = parseAllowedUserIds(ALLOWED_USER_IDS)
 
-	while (retries > 0) {
-		const res = await fetch(
-			`https://api.telegram.org/bot${botToken}/sendPoll`,
-			{
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify(payload)
-			}
-		)
+	const update = await c.req.json()
+	const message = update.message
 
-		const data: any = await res.json()
+	if (!message) return c.text('ok')
 
-		if (data.ok) return { success: true }
-
-		if (data.error_code === 429) {
-			const wait = data.parameters?.retry_after || 3
-			await sleep(wait * 1000)
-			retries--
-			continue
-		}
-
-		return { success: false, error: data.description }
+	if (!message.from?.id || !allowedUserIds.includes(message.from.id)) {
+		return c.text('Unauthorized')
 	}
 
-	return { success: false, error: 'Max retries exceeded' }
-}
+	// 🔥 STOP COMMAND
+	if (message.text && message.text.toLowerCase() === 'stop') {
+		await BOT_KV.put(`stop:${message.from.id}`, '1', { expirationTtl: 600 })
 
-// 🔥 MAIN HANDLER (non-blocking)
-app.post('/', async (c) => {
-	const update = await c.req.json()
+		await sendMessage(BOT_TOKEN, message.from.id, '⚠️ Upload stop requested')
 
-	// respond immediately
-	c.executionCtx.waitUntil(processUpdate(c, update))
+		return c.text('ok')
+	}
+
+	// FILE CHECK
+	if (!message.document) return c.text('ok')
+
+	if (!message.document.file_name?.toLowerCase().endsWith('.json')) {
+		await sendMessage(BOT_TOKEN, message.from.id, '❌ Only JSON files allowed')
+		return c.text('ok')
+	}
+
+	// PUSH TO QUEUE
+	await mcqqueue.send({
+		fileId: message.document.file_id,
+		userId: message.from.id
+	})
+
+	await sendMessage(
+		BOT_TOKEN,
+		message.from.id,
+		'📥 File received. Processing will start shortly...'
+	)
 
 	return c.text('ok')
 })
 
-// 🔥 PROCESS LOGIC
-async function processUpdate(c: any, update: any) {
-	const { BOT_TOKEN, CHANNEL_USERNAME, ALLOWED_USER_IDS, BOT_KV } = c.env
+// ================= QUEUE CONSUMER =================
+export default {
+	fetch: app.fetch,
 
-	const allowedUserIds = parseAllowedUserIds(ALLOWED_USER_IDS)
-	const message = update.message
+	async queue(batch: MessageBatch<any>, env: Bindings) {
+		const { BOT_TOKEN, CHANNEL_USERNAME, BOT_KV } = env
 
-	if (!message) return
+		for (const msg of batch.messages) {
+			const { fileId, userId } = msg.body
 
-	// 🔐 user check
-	if (!message.from?.id || !allowedUserIds.includes(message.from.id)) return
+			try {
+				// Get file path
+				const fileRes = await fetch(
+					`https://api.telegram.org/bot${BOT_TOKEN}/getFile`,
+					{
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({ file_id: fileId })
+					}
+				)
 
-	if (!message.document) return
-	if (!message.document.file_name?.endsWith('.json')) return
+				const fileData: any = await fileRes.json()
+				if (!fileData.ok) throw new Error('File fetch failed')
 
-	const updateKey = `update:${update.update_id}`
+				const filePath = fileData.result.file_path
 
-	// 🔥 DUPLICATE PROTECTION
-	const alreadyProcessed = await BOT_KV.get(updateKey)
-	if (alreadyProcessed) return
+				const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`
+				const jsonFile = await fetch(fileUrl)
+				const text = await jsonFile.text()
 
-	await BOT_KV.put(updateKey, '1', { expirationTtl: 3600 }) // 1 hour
+				const questions = JSON.parse(text)
 
-	// 🔥 LOCK SYSTEM (prevent multiple uploads)
-	const lock = await BOT_KV.get('processing_lock')
-	if (lock) {
-		await sendMessage(BOT_TOKEN, message.from.id, '⚠️ Another upload is running, try later')
-		return
-	}
+				if (!Array.isArray(questions)) throw new Error('Invalid JSON')
 
-	await BOT_KV.put('processing_lock', '1', { expirationTtl: 600 }) // 10 min lock
-
-	try {
-
-		const fileId = message.document.file_id
-
-		const fileRes = await fetch(
-			`https://api.telegram.org/bot${BOT_TOKEN}/getFile`,
-			{
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ file_id: fileId })
-			}
-		)
-
-		const fileData: any = await fileRes.json()
-		if (!fileData.ok) throw new Error('File fetch failed')
-
-		const filePath = fileData.result.file_path
-
-		const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`
-		const jsonFile = await fetch(fileUrl)
-		const text = await jsonFile.text()
-
-		const questions = JSON.parse(text)
-
-		if (!Array.isArray(questions)) throw new Error('Invalid JSON')
-
-		await sleep(2000)
-
-		await sendMessage(
-			BOT_TOKEN,
-			message.from.id,
-			`📤 Upload started... total ${questions.length}`
-		)
-
-		let success = 0
-		let failed = 0
-
-		for (let i = 0; i < questions.length; i++) {
-			const q = questions[i]
-
-			const pollPayload: any = {
-				chat_id: CHANNEL_USERNAME,
-				question: q.Question,
-				options: q.Options,
-				type: "quiz",
-				correct_option_id: q.Correct_option,
-				is_anonymous: true
-			}
-
-			if (q.Explanation) {
-				pollPayload.explanation = q.Explanation
-			}
-
-			const result = await safeSendPoll(BOT_TOKEN, pollPayload)
-
-			if (result.success) success++
-			else failed++
-
-			await sleep(4000)
-
-			if ((i + 1) % 10 === 0) {
 				await sendMessage(
 					BOT_TOKEN,
-					message.from.id,
-					`📊 Progress: ${i + 1}/${questions.length}`
+					userId,
+					`📤 Upload started (${questions.length} questions)\n\nType "stop" to cancel`
+				)
+
+				let success = 0
+				let failed = 0
+
+				for (let i = 0; i < questions.length; i++) {
+					// 🔥 STOP CHECK
+					const stop = await BOT_KV.get(`stop:${userId}`)
+					if (stop) {
+						await sendMessage(BOT_TOKEN, userId, '🛑 Upload stopped')
+						await BOT_KV.delete(`stop:${userId}`)
+						break
+					}
+
+					const q = questions[i]
+
+					const pollPayload: any = {
+						chat_id: CHANNEL_USERNAME,
+						question: q.Question,
+						options: q.Options,
+						type: "quiz",
+						correct_option_id: q.Correct_option,
+						is_anonymous: true
+					}
+
+					if (q.Explanation) {
+						pollPayload.explanation = q.Explanation
+					}
+
+					const res = await fetch(
+						`https://api.telegram.org/bot${BOT_TOKEN}/sendPoll`,
+						{
+							method: 'POST',
+							headers: { 'Content-Type': 'application/json' },
+							body: JSON.stringify(pollPayload)
+						}
+					)
+
+					const data: any = await res.json()
+
+					if (data.ok) {
+						success++
+					} else {
+						failed++
+
+						await sendMessage(
+							BOT_TOKEN,
+							userId,
+							`❌ Q${q.Question_number || i + 1} failed:\n${data.description}`
+						)
+					}
+
+					// Safe delay
+					await sleep(4000)
+
+					// Progress update
+					if ((i + 1) % 10 === 0) {
+						await sendMessage(
+							BOT_TOKEN,
+							userId,
+							`📊 Progress: ${i + 1}/${questions.length}`
+						)
+					}
+				}
+
+				await sendMessage(
+					BOT_TOKEN,
+					userId,
+					`✅ ${success} polls posted\n❌ ${failed} failed`
+				)
+
+			} catch (err: any) {
+				await sendMessage(
+					env.BOT_TOKEN,
+					userId,
+					`❌ Error: ${err.message}`
 				)
 			}
+
+			msg.ack()
 		}
-
-		await sendMessage(
-			BOT_TOKEN,
-			message.from.id,
-			`✅ ${success} done\n❌ ${failed} failed`
-		)
-
-	} catch (err: any) {
-		await sendMessage(BOT_TOKEN, message.from.id, `❌ Error: ${err.message}`)
 	}
-
-	// 🔓 release lock
-	await BOT_KV.delete('processing_lock')
 }
 
+// ================= HELPER =================
 async function sendMessage(botToken: string, chatId: number, text: string) {
 	await fetch(
 		`https://api.telegram.org/bot${botToken}/sendMessage`,
@@ -188,5 +202,3 @@ async function sendMessage(botToken: string, chatId: number, text: string) {
 		}
 	)
 }
-
-export default app
